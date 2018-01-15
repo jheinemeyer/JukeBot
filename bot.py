@@ -30,7 +30,7 @@ client: APIClient   = SettingsDictBuilder({
     "PARTNER_USER": "android",
     "PARTNER_PASSWORD": "AC7IBG09A3DTSYM4R41UJWL07VLN8JI7",
     "DEVICE": "android-generic",
-	"QUALITY": "highQuality",
+	"AUDIO_QUALITY": "highQuality",
 }).build()
 
 directory = TemporaryDirectory()
@@ -92,10 +92,13 @@ async def as_user(ctx: Context, user_name: str = "", *, passwd: str = ""):
 		return
 
 	await bot.say("Pandora seems to have authenticated.")
-	await bot.change_presence(game = Game(type = 2, name = "{}'s music".format(msg.author.name)))
+	await bot.change_presence(game = Game(type = 0, name = "{}'s music".format(msg.author.name)))
 
-@login.command()
-async def default():
+	channel = bot.get_channel(id = "401908558746222592")
+	await bot.send_message(channel, "{0.author.name} has logged me into Pandora!".format(msg))
+
+@login.command(pass_context=True)
+async def default(ctx: Context):
 	client.login(config.default_user, config.default_pass)
 	await bot.say("Logged into Pandora with SkyMarshal's credentials (you lazy fuck)")
 
@@ -143,6 +146,8 @@ async def play(ctx: Context):
 	playlist: Playlist = client.get_playlist(client.get_station_list()[0].id)
 	song: PlaylistItem = playlist.pop()
 
+	pprint(song)
+
 	file: Path = Path(directory.name, song.track_token)
 	with http.request("GET", song.audio_url, preload_content = False) as resp, file.open('wb') as fd:
   	  shutil.copyfileobj(resp, fd)
@@ -151,16 +156,20 @@ async def play(ctx: Context):
 	player: StreamPlayer = voice.create_ffmpeg_player(
 		file.open('rb'),
 		pipe = True,
+		#options = " -filter:a loudnorm ",
 		after = callback
 	)
+
+	print(file)
 
 	await bot.say("Now playing `{}` by `{}`".format(song.song_name, song.artist_name))
 	#player.volume = 0.15
 	player.start()
 
-def callback_done(player, bot, file, channel):
+def callback_done(player: StreamPlayer, bot: Bot, file: Path, channel: Channel):
 	file.unlink()
 	pprint(channel)
-	bot.send_message(channel, "Song finished")
+	asyncio.ensure_future(bot.send_message(channel, "Song finsihed"), asyncio.get_event_loop())
 
 bot.run(config.token)
+
