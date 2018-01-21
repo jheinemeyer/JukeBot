@@ -4,6 +4,7 @@ from discord.player import FFmpegPCMAudio
 
 import datetime, re
 import asyncio
+import math
 import logging
 import aiohttp
 from yarl import URL
@@ -18,8 +19,8 @@ from pathlib  import Path
 from datetime import timedelta
 import functools
 
-from pandora.models.pandora	import PlaylistItem
 from pandora.clientbuilder	import SettingsDictBuilder
+from station import Station, Song
 
 from utils import predicates
 
@@ -41,6 +42,9 @@ class JukeBot(commands.Bot):
 		self.add_command(self.list)
 		self.add_command(self.stations)
 		self.add_command(self.play)
+		self.add_command(self.pause)
+		self.add_command(self.resume)
+		self.add_command(self.skip)
 
 	def run(self):
 		super().run(config.token, reconnect=True)
@@ -70,7 +74,7 @@ class JukeBot(commands.Bot):
 	async def shutdown(self, ctx):
 		await self.close()
 
-	@commands.group(name="login")
+	@commands.group(name="login", invoke_without_command=True)
 	async def login_pandora(self, ctx):
 		if ctx.invoked_subcommand == None:
 			await ctx.send("Login commands should be done in private messages.")
@@ -80,9 +84,7 @@ class JukeBot(commands.Bot):
 			await ctx.send("Re-issue the command in this DM with the syntax `!login as [user] [password...]`")
 			return '''
 
-	@login_pandora.command(name="as")
-	@predicates.is_private()
-	async def pandora_login_as_user(self, ctx, user_name: str = "", *, passwd: str = ""):
+	def login_as_user(self, user_name: str = "", passwd: str = ""):
 		client = SettingsDictBuilder({
 			"DECRYPTION_KEY": "R=U!LH$O2B#",
 			"ENCRYPTION_KEY": "6#26FRL$ZWD",
@@ -94,11 +96,19 @@ class JukeBot(commands.Bot):
 
 		try:
 			client.login(user_name, passwd)
-		except Exception as e:
-			await ctx.send("Could not log in: {0}".format(e))
-			return
+		except:
+			raise
 
 		self.client = client
+
+	@login_pandora.command(name="as")
+	@predicates.is_private()
+	async def pandora_login_as_user(self, ctx, user_name: str = "", *, passwd: str = ""):
+		try:
+			self.login_as_user(user_name, passwd)
+		except Exception as e:
+			return await ctx.send("Could not log in: {0}".format(e))
+
 		await ctx.send("Pandora seems to have authenticated.")
 		await self.change_presence(game = discord.Game(type = 0, name = "{0.message.author.name}'s music".format(ctx)))
 		await self.default_channel.send("{0.message.author.name} has logged me into Pandora!".format(ctx))
@@ -106,7 +116,10 @@ class JukeBot(commands.Bot):
 	@login_pandora.command()
 	@commands.is_owner()
 	async def default(self, ctx):
-		await self.pandora_login_as_user(ctx, config.default_user, config.default_pass)
+		self.login_as_user(config.default_user, config.default_pass)
+
+		await self.change_presence(game = discord.Game(type = 0, name = "{0.message.author.name}'s music".format(ctx)))
+		await self.default_channel.send("{0.message.author.name} has logged me into Pandora!".format(ctx))
 
 	@commands.group()
 	async def list(self, ctx):
@@ -114,18 +127,30 @@ class JukeBot(commands.Bot):
 			await ctx.send("List what?")
 
 	@list.command()
-	async def stations(self, ctx):
+	async def stations(self, ctx: commands.Context):
 		try:
 			stations = self.client.get_station_list()
 		except:
 			await ctx.send("I could not fetch any availible stations")
 			return
 
-		await ctx.send("Available stations:\n```" + "\n".join(map((lambda x: x.name), stations)) + "```")
+		# I'm assuming the order of the stations returned is durable.
+		#   It's a prototype, alright?  It _totally_ won't see production.
+		embed = discord.Embed(title = "Available Stations")
+
+		i: int = 0
+		station_list: [str] = []
+		for station in stations:
+			i    += 1
+			name  = station.name[:-6] if station.name.endswith(" Radio") else station.name
+			station_list.append('#{:>3}:{:>30}'.format(str(i), name))
+
+		embed.description = "```" + "\n".join(station_list) + "```"
+		await ctx.send(embed=embed)
 
 	@commands.command()
 	@predicates.not_private()
-	async def play(self, ctx: commands.Context):
+	async def play(self, ctx: commands.Context, index: int = 1):
 		if self.client is None:
 			await ctx.send("I haven't been logged into Pandora, yet!")
 			return
@@ -136,46 +161,70 @@ class JukeBot(commands.Bot):
 			await ctx.send("You aren't in any voice channel... you tit!")
 			return
 
+		stations = self.client.get_station_list()
+
+		index -= 1
+		if index < 0 or index > (len(stations) - 1):
+			await ctx.send("There are no stations with that index.")
+			return
+
+		# Create the station handler
+		station: Station = Station(dir = self.directory, loop = self.loop, station = stations[index])
+		await station._fill_buffer()
+		
 		if ctx.voice_client is None:
 			voice = await voice_state.channel.connect()
 		else:
 			voice = ctx.voice_client
 			await voice.move_to(voice_state.channel)
-		
-		# For debugging, first song in first playlist.
-		song: PlaylistItem = self.client.get_playlist(self.client.get_station_list()[0].id).pop()
-		pprint(song)
 
-		# Create a temporary file.
-		url = URL(song.audio_url)
-		file: Path = Path(self.directory.name, url.name)
-		print(file)
+		# Kick off the playlist
+		await self.play_station(ctx, station=station, voice=voice)
 
-		# Buffer the song into the temp file
-		async with aiohttp.ClientSession() as session:
-			async with session.get(url) as r:
-				with file.open('wb') as fd:
-					fd.write(await r.content.read())
+	@commands.command()
+	async def pause(self, ctx):
+		if ctx.voice_client:
+			ctx.voice_client.pause()
+			return
 
-		player = FFmpegPCMAudio(file.open('rb'), pipe = True)
+		ctx.send("You don't seem to be in a voice channel, {0.author.name}...".format(ctx))
 
-		def cleanup(error):
+	@commands.command()
+	async def resume(self, ctx):
+		if ctx.voice_client:
+			ctx.voice_client.resume()
+			return
+
+		ctx.send("You don't seem to be in a voice channel, {0.author.name}...".format(ctx))
+
+	@commands.command()
+	async def skip(self, ctx):
+		if ctx.voice_client:
+			ctx.voice_client.stop()
+			return
+
+		ctx.send("You don't seem to be in a voice channel, {0.author.name}...".format(ctx))
+
+	async def play_station(self, ctx, station, voice):
+		song: Song = await station.dequeue()
+
+		def play_next(error):
+			if self._closed.is_set():
+				return
+
 			print("Reached callback")
-			coro = self.on_song_done(ctx, file)
+			coro = self.play_station(ctx=ctx, station=station, voice=voice)
 			fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
 			try:
 				fut.result()
 			except:
 				pass
 
-		voice.play(player, after = cleanup)
+		voice.play(song, after = play_next)
 
-		delta = timedelta(seconds = song.track_length)
-		await ctx.send("Now playing `{0.song_name}` by `{0.artist_name}` ({1})".format(song, delta))
-
-	async def on_song_done(self, ctx, file):
-		file.unlink()
-		await ctx.send("Song finsihed")
+		minutes = int(song.length / 60)
+		seconds = song.length % 60
+		await ctx.send("Now playing: `{0.name}` (by {0.artist}, {1}:{2:0>2})".format(song, minutes, seconds))
 
 
 if __name__ == "__main__":
